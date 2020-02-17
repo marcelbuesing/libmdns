@@ -1,11 +1,14 @@
-use futures::sync::mpsc;
-use futures::Future;
+#![recursion_limit="256"]
+
+use core::pin::Pin;
+use futures_util::future::FutureExt;
+use futures::channel::{mpsc, oneshot};
+use futures:: {future, Future};
 use log::warn;
 use std::cell::RefCell;
 use std::io;
 use std::sync::{Arc, RwLock};
-use std::thread;
-use tokio_core::reactor::{Core, Handle};
+use tokio::runtime::{Handle, Runtime};
 
 mod dns_parser;
 use crate::dns_parser::Name;
@@ -34,42 +37,47 @@ pub struct Service {
     _shutdown: Arc<Shutdown>,
 }
 
-type ResponderTask = Box<dyn Future<Item = (), Error = io::Error> + Send>;
+type ResponderTask = Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>>;
 
 impl Responder {
-    fn setup_core() -> io::Result<(Core, ResponderTask, Responder)> {
-        let core = Core::new()?;
-        let (responder, task) = Self::with_handle(&core.handle())?;
-        Ok((core, task, responder))
+    async fn setup_core() -> io::Result<(Runtime, ResponderTask, Responder)> {
+        let runtime = Runtime::new()?;
+        let (responder, task) = Self::with_handle(&runtime.handle()).await?;
+        Ok((runtime, task, responder))
     }
 
-    pub fn new() -> io::Result<Responder> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
-        thread::Builder::new()
-            .name("mdns-responder".to_owned())
-            .spawn(move || match Self::setup_core() {
-                Ok((mut core, task, responder)) => {
-                    tx.send(Ok(responder)).expect("tx responder channel closed");
-                    core.run(task).expect("mdns thread failed");
-                }
-                Err(err) => {
-                    tx.send(Err(err)).expect("tx responder channel closed");
-                }
-            })?;
+    pub async fn new() -> io::Result<Responder> {
+        let (tx, rx) = oneshot::channel();
 
-        rx.recv().expect("rx responder channel closed")
+        match Self::setup_core().await {
+            Ok((runtime, task, responder)) => {
+                if let Err(_) = tx.send(Ok(responder)) {
+                    panic!("tx responder channel closed");
+                }
+                runtime.spawn(task);
+            }
+            Err(err) => {
+                if let Err(_) = tx.send(Err(err)) {
+                    panic!("tx responder channel closed");
+                }
+            }
+        };
+
+        rx.await.expect("rx responder channel closed")
     }
 
-    pub fn spawn(handle: &Handle) -> io::Result<Responder> {
-        let (responder, task) = Responder::with_handle(handle)?;
-        handle.spawn(task.map_err(|e| {
-            warn!("mdns error {:?}", e);
-            ()
-        }));
+    pub async fn spawn(handle: &Handle) -> io::Result<Responder> {
+        let (responder, task) = Responder::with_handle(&handle).await?;
+        handle.spawn(async {
+            if let Err(e) = task.await {
+                warn!("mdns error {:?}", e);
+
+            }
+        });
         Ok(responder)
     }
 
-    pub fn with_handle(handle: &Handle) -> io::Result<(Responder, ResponderTask)> {
+    pub async fn with_handle(handle: &Handle) -> io::Result<(Responder, ResponderTask)> {
         let mut hostname = match hostname::get() {
             Ok(s) => match s.into_string() {
                 Ok(s) => s,
@@ -91,17 +99,16 @@ impl Responder {
         let v4 = FSM::<Inet>::new(handle, &services);
         let v6 = FSM::<Inet6>::new(handle, &services);
 
-        let (task, commands): (ResponderTask, _) = match (v4, v6) {
-            (Ok((v4_task, v4_command)), Ok((v6_task, v6_command))) => {
-                let task = v4_task.join(v6_task).map(|((), ())| ());
-                let task = Box::new(task);
-                let commands = vec![v4_command, v6_command];
-                (task, commands)
+        let (task, commands) = match (v4, v6) {
+            (Ok((mut v4_task, v4_command)), Ok((mut v6_task, v6_command))) => {
+                let task = future::join(v4_task.run(), v6_task.run()).map(|_| Ok(()));
+                (task.boxed(), vec![v4_command, v6_command])
             }
 
-            (Ok((v4_task, v4_command)), Err(err)) => {
+            (Ok((mut v4_task, v4_command)), Err(err)) => {
                 warn!("Failed to register IPv6 receiver: {:?}", err);
-                (Box::new(v4_task), vec![v4_command])
+                let task = v4_task.run();
+                (task.boxed(), vec![v4_command])
             }
 
             (Err(err), _) => return Err(err),

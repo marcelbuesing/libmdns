@@ -1,15 +1,16 @@
 use crate::dns_parser::{self, Name, QueryClass, QueryType, RRData};
-use futures::sync::mpsc;
-use futures::{Async, Future, Poll, Stream};
+use futures::channel::mpsc;
+use futures::{SinkExt, select};
+use futures_util::stream::StreamExt;
+use futures_util::future::FutureExt;
 use get_if_addrs::get_if_addrs;
 use log::{debug, error, trace, warn};
-use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::io;
-use std::io::ErrorKind::WouldBlock;
 use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr};
-use tokio_core::net::UdpSocket;
-use tokio_core::reactor::Handle;
+use tokio::net::UdpSocket;
+use tokio::runtime::Handle;
 
 use super::{DEFAULT_TTL, MDNS_PORT};
 use crate::address_family::AddressFamily;
@@ -31,7 +32,8 @@ pub struct FSM<AF: AddressFamily> {
     socket: UdpSocket,
     services: Services,
     commands: mpsc::UnboundedReceiver<Command>,
-    outgoing: VecDeque<(Vec<u8>, SocketAddr)>,
+    outgoing_rx: mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    outgoing_tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
     _af: PhantomData<AF>,
 }
 
@@ -41,40 +43,40 @@ impl<AF: AddressFamily> FSM<AF> {
         services: &Services,
     ) -> io::Result<(FSM<AF>, mpsc::UnboundedSender<Command>)> {
         let std_socket = AF::bind()?;
-        let socket = UdpSocket::from_socket(std_socket, handle)?;
+        let socket = UdpSocket::try_from(std_socket)?;
         let (tx, rx) = mpsc::unbounded();
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded();
 
         let fsm = FSM {
             socket: socket,
             services: services.clone(),
             commands: rx,
-            outgoing: VecDeque::new(),
+            outgoing_rx,
+            outgoing_tx,
             _af: PhantomData,
         };
 
         Ok((fsm, tx))
     }
 
-    fn recv_packets(&mut self) -> io::Result<()> {
+    async fn recv_packet(&mut self) -> io::Result<()> {
         let mut buf = [0u8; 4096];
-        loop {
-            let (bytes, addr) = match self.socket.recv_from(&mut buf) {
-                Ok((bytes, addr)) => (bytes, addr),
-                Err(ref ioerr) if ioerr.kind() == WouldBlock => break,
-                Err(err) => return Err(err),
-            };
+        // loop {
+        let (bytes, addr) = match self.socket.recv_from(&mut buf).await {
+            Ok((bytes, addr)) => (bytes, addr),
+            // Err(ref ioerr) if ioerr.kind() == WouldBlock => break,
+            Err(err) => return Err(err),
+        };
 
-            if bytes >= buf.len() {
-                warn!("buffer too small for packet from {:?}", addr);
-                continue;
-            }
-
-            self.handle_packet(&buf[..bytes], addr);
+        if bytes >= buf.len() {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("buffer too small for packet from {:?}", addr)));
         }
+
+        self.handle_packet(&buf[..bytes], addr);
         Ok(())
     }
 
-    fn handle_packet(&mut self, buffer: &[u8], addr: SocketAddr) {
+    async fn handle_packet(&mut self, buffer: &[u8], addr: SocketAddr) {
         trace!("received packet from {:?}", addr);
 
         let packet = match dns_parser::Packet::parse(buffer) {
@@ -121,12 +123,12 @@ impl<AF: AddressFamily> FSM<AF> {
         if !multicast_builder.is_empty() {
             let response = multicast_builder.build().unwrap_or_else(|x| x);
             let addr = SocketAddr::new(AF::mdns_group(), MDNS_PORT);
-            self.outgoing.push_back((response, addr));
+            self.outgoing_tx.send((response, addr)).await;
         }
 
         if !unicast_builder.is_empty() {
             let response = unicast_builder.build().unwrap_or_else(|x| x);
-            self.outgoing.push_back((response, addr));
+            self.outgoing_tx.send((response, addr)).await;
         }
     }
 
@@ -197,7 +199,7 @@ impl<AF: AddressFamily> FSM<AF> {
         builder
     }
 
-    fn send_unsolicited(&mut self, svc: &ServiceData, ttl: u32, include_ip: bool) {
+    async fn send_unsolicited(&mut self, svc: &ServiceData, ttl: u32, include_ip: bool) {
         let mut builder =
             dns_parser::Builder::new_response(0, false, true).move_to::<dns_parser::Answers>();
         builder.set_max_size(None);
@@ -214,52 +216,44 @@ impl<AF: AddressFamily> FSM<AF> {
         if !builder.is_empty() {
             let response = builder.build().unwrap_or_else(|x| x);
             let addr = SocketAddr::new(AF::mdns_group(), MDNS_PORT);
-            self.outgoing.push_back((response, addr));
+            self.outgoing_tx.send((response, addr)).await;
         }
     }
-}
 
-impl<AF: AddressFamily> Future for FSM<AF> {
-    type Item = ();
-    type Error = io::Error;
-    fn poll(&mut self) -> Poll<(), io::Error> {
-        while let Async::Ready(cmd) = self.commands.poll().unwrap() {
-            match cmd {
-                Some(Command::Shutdown) => return Ok(Async::Ready(())),
-                Some(Command::SendUnsolicited {
-                    svc,
-                    ttl,
-                    include_ip,
-                }) => {
-                    self.send_unsolicited(&svc, ttl, include_ip);
-                }
-                None => {
-                    warn!("responder disconnected without shutdown");
-                    return Ok(Async::Ready(()));
-                }
-            }
-        }
-
-        while let Async::Ready(()) = self.socket.poll_read() {
-            self.recv_packets()?;
-        }
+    pub async fn run(mut self) -> Result<(), io::Error> {
 
         loop {
-            if let Some(&(ref response, ref addr)) = self.outgoing.front() {
-                trace!("sending packet to {:?}", addr);
+            select! {
+                cmd = self.commands.next().fuse() => {
+                    match cmd {
+                        Some(Command::Shutdown) => return Ok(()),
+                        Some(Command::SendUnsolicited {
+                            svc,
+                            ttl,
+                            include_ip,
+                        }) => {
+                            self.send_unsolicited(&svc, ttl, include_ip);
+                        }
+                        None => {
+                            warn!("responder disconnected without shutdown");
+                            return Ok(());
+                        }
+                    }
+                },
+                _ = self.recv_packet().fuse() => (),
+                response = self.outgoing_rx.next().fuse() => {
+                    match response {
+                        Some((response, addr)) => {
+                            trace!("sending packet to {:?}", addr);
 
-                match self.socket.send_to(response, addr) {
-                    Ok(_) => (),
-                    Err(ref ioerr) if ioerr.kind() == WouldBlock => break,
-                    Err(err) => warn!("error sending packet {:?}", err),
+                            if let Err(err) = self.socket.send_to(&response, addr).await {
+                                 warn!("error sending packet {:?}", err);
+                            }
+                        },
+                        None => (), // TODO handle ?
+                    }
                 }
-            } else {
-                break;
             }
-
-            self.outgoing.pop_front();
         }
-
-        Ok(Async::NotReady)
     }
 }
